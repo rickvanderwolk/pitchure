@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pitchure</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            display: block;
+        }
+        #start-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            z-index: 10;
+        }
+        #start-overlay span {
+            color: #fff;
+            font-family: system-ui, sans-serif;
+            font-size: 24px;
+        }
+        #start-overlay.hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="start-overlay">
+        <span>Click to start</span>
+    </div>
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const overlay = document.getElementById('start-overlay');
+
+        let width, height;
+        let audioContext, analyser, dataArray, freqArray;
+
+        // Drawing state
+        let penX, penY;
+        let lastX, lastY;
+        let isDrawing = false;
+        let currentAngle = 0;
+        let strokeCount = 0;
+        let silenceFrames = 0;
+
+        // Adaptive scaling
+        let peakVolume = 0.1;
+        let peakWaveform = 0.3;
+        const adaptSpeed = 0.02;  // How fast it adapts (lower = slower)
+        const decaySpeed = 0.001; // How fast peaks decay
+
+        // Onset detection
+        let prevEnergy = 0;
+        let energyHistory = [];
+        const historySize = 20;
+        const onsetThreshold = 1.8;  // Moderate sensitivity
+        let onsetCooldown = 0;
+        const cooldownFrames = 35;   // Enough time to see waveform before next turn
+
+        // Color shift on beat
+        let baseHue = Math.random() * 360;
+        const hueShiftAmount = 40 + Math.random() * 30; // 40-70° shift per beat
+
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, width, height);
+            penX = width / 2;
+            penY = height / 2;
+            lastX = penX;
+            lastY = penY;
+        }
+
+        resize();
+        window.addEventListener('resize', resize);
+
+        function getVolume() {
+            analyser.getByteTimeDomainData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+                const val = (dataArray[i] - 128) / 128;
+                sum += val * val;
+            }
+            const rawVolume = Math.sqrt(sum / dataArray.length);
+
+            // Update adaptive peak (grows fast, decays slow)
+            if (rawVolume > peakVolume) {
+                peakVolume = rawVolume;
+            } else {
+                peakVolume = Math.max(0.05, peakVolume - decaySpeed);
+            }
+
+            // Return normalized volume (0-1 range relative to recent peaks)
+            return Math.min(1, rawVolume / peakVolume);
+        }
+
+        function getWaveformData(numSamples) {
+            analyser.getByteTimeDomainData(dataArray);
+            const samples = [];
+            const step = Math.floor(dataArray.length / numSamples);
+            let maxAbs = 0;
+
+            for (let i = 0; i < numSamples; i++) {
+                // -1 to 1 range
+                const val = (dataArray[i * step] - 128) / 128;
+                samples.push(val);
+                maxAbs = Math.max(maxAbs, Math.abs(val));
+            }
+
+            // Update adaptive peak (grows fast, decays slow)
+            if (maxAbs > peakWaveform) {
+                peakWaveform = maxAbs;
+            } else {
+                peakWaveform = Math.max(0.1, peakWaveform - decaySpeed);
+            }
+
+            // Normalize samples to use full range
+            const normalized = samples.map(s => s / peakWaveform);
+            return normalized;
+        }
+
+        // Frequency bands (logarithmic split)
+        // Low: 20-250 Hz (bass, low voice)
+        // Mid: 250-2000 Hz (voice, instruments)
+        // High: 2000-20000 Hz (brightness, sibilance)
+        const BAND_LOW = { min: 20, max: 250 };
+        const BAND_MID = { min: 250, max: 2000 };
+        const BAND_HIGH = { min: 2000, max: 20000 };
+
+        // Peak tracking for each band
+        let peakLow = 0.1, peakMid = 0.1, peakHigh = 0.1;
+        const bandDecay = 0.002;
+
+        function getBandEnergy(minFreq, maxFreq) {
+            const minBin = Math.floor(minFreq * analyser.fftSize / audioContext.sampleRate);
+            const maxBin = Math.floor(maxFreq * analyser.fftSize / audioContext.sampleRate);
+
+            let sum = 0;
+            for (let i = minBin; i < maxBin; i++) {
+                sum += freqArray[i];
+            }
+            return sum / (maxBin - minBin);
+        }
+
+        function detectOnset(currentVolume) {
+            // Add to history
+            energyHistory.push(currentVolume);
+            if (energyHistory.length > historySize) {
+                energyHistory.shift();
+            }
+
+            // Calculate average
+            const avg = energyHistory.reduce((a, b) => a + b, 0) / energyHistory.length;
+
+            // Detect onset: current much higher than average, and cooldown passed
+            const isOnset = currentVolume > avg * onsetThreshold &&
+                           currentVolume > 0.05 &&
+                           onsetCooldown === 0;
+
+            if (isOnset) {
+                onsetCooldown = cooldownFrames;
+            }
+
+            if (onsetCooldown > 0) onsetCooldown--;
+
+            return isOnset;
+        }
+
+        function getColorFromBands() {
+            analyser.getByteFrequencyData(freqArray);
+
+            let low = getBandEnergy(BAND_LOW.min, BAND_LOW.max);
+            let mid = getBandEnergy(BAND_MID.min, BAND_MID.max);
+            let high = getBandEnergy(BAND_HIGH.min, BAND_HIGH.max);
+
+            // Update adaptive peaks
+            if (low > peakLow) peakLow = low; else peakLow = Math.max(10, peakLow - bandDecay * 255);
+            if (mid > peakMid) peakMid = mid; else peakMid = Math.max(10, peakMid - bandDecay * 255);
+            if (high > peakHigh) peakHigh = high; else peakHigh = Math.max(10, peakHigh - bandDecay * 255);
+
+            // Normalize each band 0-1
+            const normLow = low / peakLow;
+            const normMid = mid / peakMid;
+            const normHigh = high / peakHigh;
+
+            const total = normLow + normMid + normHigh + 0.001;
+
+            // Weighted hue: low=0 (red), mid=120 (green), high=240 (blue)
+            const hue = (normLow * 0 + normMid * 120 + normHigh * 240) / total;
+
+            // Saturation: high when one band dominates, lower when mixed
+            const maxBand = Math.max(normLow, normMid, normHigh);
+            const saturation = 60 + maxBand * 40;
+
+            // Lightness from overall energy
+            const lightness = 40 + (total / 3) * 30;
+
+            return { hue, saturation, lightness, normLow, normMid, normHigh };
+        }
+
+        // Smart start position
+        function getStartPosition(volume) {
+            // Short silence: continue nearby
+            if (silenceFrames < 120) {
+                const offsetAngle = Math.random() * Math.PI * 2;
+                const offsetDist = 20 + volume * 50;
+                return {
+                    x: penX + Math.cos(offsetAngle) * offsetDist,
+                    y: penY + Math.sin(offsetAngle) * offsetDist
+                };
+            }
+
+            // Long silence: random position
+            const x = width * 0.1 + Math.random() * width * 0.8;
+            const y = height * 0.1 + Math.random() * height * 0.8;
+            return { x, y };
+        }
+
+        function draw() {
+            if (!analyser) {
+                requestAnimationFrame(draw);
+                return;
+            }
+
+            const volume = getVolume();
+            const color = getColorFromBands();
+            const isOnset = detectOnset(volume);
+            const threshold = 0.015;
+
+            const hasSound = volume > threshold;
+
+            if (hasSound) {
+                // Start new stroke if pen was up
+                if (!isDrawing) {
+                    strokeCount++;
+                    const startPos = getStartPosition(volume);
+                    penX = Math.max(10, Math.min(width - 10, startPos.x));
+                    penY = Math.max(10, Math.min(height - 10, startPos.y));
+                    lastX = penX;
+                    lastY = penY;
+                    isDrawing = true;
+
+                    // Random direction for this stroke
+                    currentAngle = Math.random() * Math.PI * 2;
+
+                    // Fade old content occasionally
+                    if (strokeCount > 50) {
+                        ctx.fillStyle = 'rgba(0, 0, 0, 0.08)';
+                        ctx.fillRect(0, 0, width, height);
+                        strokeCount = 30;
+                    }
+                }
+
+                // Change direction and color on beat/onset
+                if (isOnset) {
+                    // Volume determines turn angle: soft=20°, loud=160°
+                    const minTurn = Math.PI / 9;   // 20°
+                    const maxTurn = Math.PI * 0.9; // 160°
+                    const turnAmount = minTurn + volume * (maxTurn - minTurn);
+                    const turnDir = Math.random() > 0.5 ? 1 : -1;
+                    currentAngle += turnAmount * turnDir;
+
+                    // Shift color
+                    baseHue = (baseHue + hueShiftAmount) % 360;
+                }
+
+                silenceFrames = 0;
+
+                // Get actual waveform data
+                const waveformSamples = getWaveformData(32);
+
+                // Volume determines forward speed
+                const speed = 1 + volume * 5;
+
+                // Waveform amplitude: base + volume + low freq boost + silence boost
+                const lowFreqBoost = color.normLow * 40;  // Bass = bigger
+                const silenceBoost = Math.min(silenceFrames / 60, 1) * 30;  // After silence = bigger (builds up over 1 sec)
+                const waveAmplitude = 20 + volume * 40 + lowFreqBoost + silenceBoost;
+
+                // Fixed direction during stroke - clear waveform visible
+                const angle = currentAngle;
+                const perpAngle = angle + Math.PI / 2;
+
+                let drawX = penX;
+                let drawY = penY;
+                let prevX = lastX;
+                let prevY = lastY;
+
+                for (let i = 0; i < waveformSamples.length; i++) {
+                    const waveValue = waveformSamples[i];
+
+                    // Move forward in fixed direction
+                    const stepSize = speed / waveformSamples.length;
+                    drawX += Math.cos(angle) * stepSize;
+                    drawY += Math.sin(angle) * stepSize;
+
+                    // Perpendicular offset for visible waveform shape
+                    const waveOffset = waveValue * waveAmplitude;
+                    const pointX = drawX + Math.cos(perpAngle) * waveOffset;
+                    const pointY = drawY + Math.sin(perpAngle) * waveOffset;
+
+                    // Color: positive/negative offset from baseHue
+                    const hueOffset = waveValue > 0 ? 30 : -30;
+                    const hue = (baseHue + hueOffset + 360) % 360;
+                    const sat = 70 + volume * 25;
+                    const light = 45 + volume * 20;
+
+                    ctx.beginPath();
+                    ctx.moveTo(prevX, prevY);
+                    ctx.lineTo(pointX, pointY);
+                    ctx.strokeStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
+                    ctx.lineWidth = 1.5 + volume * 3;
+                    ctx.lineCap = 'round';
+                    ctx.stroke();
+
+                    prevX = pointX;
+                    prevY = pointY;
+                }
+
+                // Gentle edge avoidance
+                const edgeMargin = 80;
+                const edgeForce = 0.05;
+                if (drawX < edgeMargin) currentAngle += edgeForce;
+                if (drawX > width - edgeMargin) currentAngle -= edgeForce;
+                if (drawY < edgeMargin) currentAngle += Math.cos(currentAngle) > 0 ? edgeForce : -edgeForce;
+                if (drawY > height - edgeMargin) currentAngle -= Math.cos(currentAngle) > 0 ? edgeForce : -edgeForce;
+                penX = Math.max(10, Math.min(width - 10, drawX));
+                penY = Math.max(10, Math.min(height - 10, drawY));
+                lastX = prevX;
+                lastY = prevY;
+
+            } else {
+                // Silence = pen up
+                isDrawing = false;
+                silenceFrames++;
+            }
+
+            requestAnimationFrame(draw);
+        }
+
+        async function start() {
+            overlay.classList.add('hidden');
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(stream);
+
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                analyser.smoothingTimeConstant = 0.5;
+
+                dataArray = new Uint8Array(analyser.fftSize);
+                freqArray = new Uint8Array(analyser.frequencyBinCount);
+
+                source.connect(analyser);
+
+                draw();
+            } catch (err) {
+                console.error('Microphone access denied:', err);
+                overlay.innerHTML = '<span>Microphone access required</span>';
+                overlay.classList.remove('hidden');
+            }
+        }
+
+        overlay.addEventListener('click', start);
+    </script>
+</body>
+</html>
